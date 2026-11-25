@@ -1,8 +1,21 @@
 # Frostpunk 2 Cheat Table
 
-A Cheat Engine table for Frostpunk 2 that lets you view and edit resources for every settlement in your game: the main city and each colony.
+Due to a bug I got in a playthrough I was very invested into, I needed a CT
+table for Frostpunk 2, and due to none of the available ones working I built this,
+in order to fix my issue, but it spiraled into a whole reverse engineering project itself.
+Feel free to use it as you wish, do not distribute.
+The table lets you view and edit
+resources for both the main city and each colony.
 
-Unlike most tables, it doesn't depend on hard-coded addresses. It finds the game's own data structures by searching for code patterns, reads resource names straight from the engine, and builds the list of settlements automatically. Changing saves or adding colonies just works.
+
+Unlike most tables, it doesn't depend on hard-coded addresses.
+It finds the game's own data structures by searching for code patterns,
+reads resource names straight from the engine, and builds the list of 
+settlements automatically. Changing saves or adding colonies works.
+
+It may need revisiting in the future
+
+![The table loaded in Cheat Engine](img.png)
 
 ## What you can edit
 
