@@ -1,0 +1,472 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="45">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>0</ID>
+      <Description>"Find resources (tick me, enter current numbers)"</Description>
+      <Options moHideChildren="1"/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local hs = tonumber(inputQuery("Frostpunk 2", "Current heatstamps:", ""))
+local pf = tonumber(inputQuery("Frostpunk 2", "Current prefabs:", ""))
+local co = tonumber(inputQuery("Frostpunk 2", "Current cores:", ""))
+if not hs or not pf or not co then error("Need all three numbers") end
+-- stockpile entries are 0x18 apart, order differs per save, so look at neighbouring entries
+local function near(a, v)
+  for k = -16, 16 do
+    if k ~= 0 and readInteger(a + k * 0x18) == v then return a + k * 0x18 end
+  end
+end
+local ms = createMemScan()
+ms.firstScan(soExactValue, vtDword, rtRounded, tostring(hs), "", 0, 0x7fffffffffffffff, "+W-C", fsmAligned, "8", false, false, false, false)
+ms.waitTillDone()
+local fl = createFoundList(ms)
+fl.initialize()
+local found = {}
+for i = 0, fl.Count - 1 do
+  local a = tonumber(fl.Address[i], 16)
+  local p, c = near(a, pf), near(a, co)
+  if p and c then found[#found + 1] = {a, p, c} end
+end
+fl.destroy()
+ms.destroy()
+if #found == 0 then error("Not found - unpause briefly, re-pause and check the numbers") end
+if #found > 1 then print(("Found %d matches, using the first"):format(#found)) end
+registerSymbol("fp2res", found[1][1], true)
+registerSymbol("fp2pf", found[1][2], true)
+registerSymbol("fp2cores", found[1][3], true)
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+unregisterSymbol("fp2res")
+unregisterSymbol("fp2pf")
+unregisterSymbol("fp2cores")
+{$asm}
+</AssemblerScript>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>1</ID>
+          <Description>"Heatstamps"</Description>
+          <ShowAsSigned>0</ShowAsSigned>
+          <VariableType>4 Bytes</VariableType>
+          <Address>fp2res</Address>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>2</ID>
+          <Description>"Prefabs"</Description>
+          <ShowAsSigned>0</ShowAsSigned>
+          <VariableType>4 Bytes</VariableType>
+          <Address>fp2pf</Address>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>3</ID>
+          <Description>"Cores"</Description>
+          <ShowAsSigned>0</ShowAsSigned>
+          <VariableType>4 Bytes</VariableType>
+          <Address>fp2cores</Address>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>10</ID>
+      <Description>"Stockpiles - all settlements (tick me, no input needed)"</Description>
+      <Options moHideChildren="1"/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+
+-- every settlement (main city + each colony) owns its own PXStockpileComponent
+--   +0xB8  TMap(UPXResource*, int64) current stock   (data ptr, count at +0xC0)
+--   +0x108 TMap(UPXResource*, int64) capacity        (data ptr, count at +0x110)
+-- map entries are 0x18 bytes: key ptr, amount, hash link. order differs per save,
+-- so entries are looked up by the resource's object name
+
+local SIG_NAMES   = "48 8D 05 ?? ?? ?? ?? EB 13 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 0F 10 07"
+local SIG_OBJECTS = "48 8D 0D ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 E8 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01"
+local SIG_STOCKVT = "48 8D 05 ?? ?? ?? ?? 48 8B D9 48 89 01 8B F2 48 8D 05 ?? ?? ?? ?? 48 89 41 28 48 8D 05 ?? ?? ?? ?? 48 89 81 A8 00 00 00 C7 81 A0 01 00 00 00 00 00 00"
+-- PXEconomyHolderComponent destructor. one per settlement, owned by the same city actor.
+--   +0xD8 TMap(UPXResource*, int) production totals. guard squads are recomputed every tick
+--   from the militia entry here, so editing it is what actually changes the squad count
+local SIG_ECONVT = "48 8D 05 ?? ?? ?? ?? 48 8B D9 48 89 01 8B F2 48 8D 05 ?? ?? ?? ?? 48 89 41 28 48 8D 05 ?? ?? ?? ?? 48 89 81 A8 00 00 00 C7 81 70 01 00 00 00 00 00 00 48 8B 89 68 01 00 00 48 85 C9 74 05 E8 ?? ?? ?? ?? 48 8D 8B 28 01 00 00"
+
+local RES = {
+  {"DA_Core_Heatnotes",         "Heatstamps"},
+  {"DA_Core_PrefabsResource",   "Prefabs"},
+  {"DA_CoresResource",          "Cores"},
+  {"DA_Core_FoodResource",      "Food"},
+  {"DA_Core_MaterialsResource", "Materials"},
+  {"DA_Core_GoodsResource",     "Goods"},
+  {"DA_MilitiaResource",        "Militia"},
+}
+-- shared resources: the game shows the sum over all settlements, so we edit the main city's part
+local SHARED = {"Heatstamps", "Prefabs", "Cores"}
+local LOCAL = {"Food", "Materials", "Goods"}
+local CAPS = {"Food", "Materials", "Goods"}
+
+if fp2 and fp2.timer then fp2.timer.destroy() end
+fp2 = {names = {}, keys = {}, settlements = {}, recs = {}, lastScan = 0}
+fp2.parent = getAddressList().getMemoryRecordByID(10) or memrec
+if not fp2.parent then error("Could not find the table entry with ID 10") end
+local wanted = {}
+for _, r in ipairs(RES) do wanted[r[1]] = r[2] end
+
+local function s32(v)
+  if v and v > 0x7fffffff then return v - 0x100000000 end
+  return v
+end
+
+local function aob(sig)
+  if AOBScanModuleUnique then
+    local a = AOBScanModuleUnique("Frostpunk2-Win64-Shipping.exe", sig, "+X")
+    if a and a ~= 0 then return a end
+  end
+  local r = AOBScan(sig, "+X")
+  if not r then error("Signature not found (game updated?): " .. sig) end
+  local a = tonumber(r[0], 16)
+  r.destroy()
+  return a
+end
+
+local function riprel(a) return a + 7 + s32(readInteger(a + 3)) end
+
+fp2.GN = riprel(aob(SIG_NAMES))
+fp2.GO = riprel(aob(SIG_OBJECTS))
+fp2.aob, fp2.riprel = aob, riprel
+fp2.VT = riprel(aob(SIG_STOCKVT))
+fp2.VTE = riprel(aob(SIG_ECONVT))
+
+function fp2.name(o)
+  local idx = readInteger(o + 0x18)
+  if not idx then return nil end
+  local blk = readQword(fp2.GN + 0x10 + 8 * (idx // 0x10000))
+  if not blk or blk == 0 then return nil end
+  local e = blk + 2 * (idx % 0x10000)
+  local hd = readSmallInteger(e)
+  if not hd then return nil end
+  hd = hd % 0x10000
+  local len = hd // 64
+  if len == 0 or len > 250 then return nil end
+  if hd % 2 == 1 then return nil end
+  -- name pool entries are not null terminated, so read exactly len bytes
+  local b = readBytes(e + 2, len, true)
+  if not b then return nil end
+  local s = string.char(table.unpack(b))
+  local num = readInteger(o + 0x1C)
+  if s and num and num > 0 then s = s .. "_" .. (num - 1) end
+  return s
+end
+
+function fp2.valid(o)
+  local idx = readInteger(o + 0xC)
+  local n = readInteger(fp2.GO + 0x24)
+  if not idx or not n or idx >= n then return false end
+  local chunk = readQword(readQword(fp2.GO + 0x10) + 8 * (idx // 0x10000))
+  if not chunk then return false end
+  return readQword(chunk + 24 * (idx % 0x10000)) == o
+end
+
+function fp2.keyName(k)
+  local c = fp2.names[k]
+  if c then return c end
+  local ok, nm = pcall(fp2.name, k)
+  if ok and nm and wanted[nm] then
+    fp2.names[k] = wanted[nm]
+    fp2.keys[wanted[nm]] = k
+    return wanted[nm]
+  end
+  if fp2.debug and ok and nm and nm:find("^DA_") then
+    print(string.format("FP2 debug: unmatched key %X name [%s]", k, nm))
+  end
+end
+
+function fp2.readMap(comp, off)
+  local t = {}
+  local data = readQword(comp + off)
+  local n = readInteger(comp + off + 8)
+  if not data or not n or n > 4096 then return t end
+  for i = 0, n - 1 do
+    local e = data + 0x18 * i
+    local k = readQword(e)
+    if k and k > 0x10000 then
+      local nm = fp2.keyName(k)
+      if nm then t[nm] = e + 8 end
+    end
+  end
+  return t
+end
+
+function fp2.scan(vt)
+  local ms = createMemScan()
+  ms.firstScan(soExactValue, vtQword, rtRounded, string.format("%X", vt or fp2.VT), "", 0, 0x7fffffffffffffff, "+W-C", fsmAligned, "8", true, false, false, false)
+  ms.waitTillDone()
+  local fl = createFoundList(ms)
+  fl.initialize()
+  local list = {}
+  for i = 0, fl.Count - 1 do
+    local a = tonumber(fl.Address[i], 16)
+    if fp2.valid(a) then
+      local nm = fp2.name(a)
+      if nm and not nm:find("^Default__") then
+        list[#list + 1] = {comp = a, idx = readInteger(a + 0xC), owner = fp2.name(readQword(a + 0x20)) or "?"}
+      end
+    end
+  end
+  fl.destroy()
+  ms.destroy()
+  table.sort(list, function(x, y) return y.idx > x.idx end)
+  fp2.lastScan = getTickCount()
+  return list
+end
+
+local function addRec(parent, desc, group)
+  local mr = getAddressList().createMemoryRecord()
+  mr.Description = desc
+  if group then
+    mr.IsGroupHeader = true
+  else
+    mr.Type = vtDword
+    mr.Address = "0"
+  end
+  mr.appendToEntry(parent)
+  return mr
+end
+
+function fp2.clear()
+  local p = fp2.parent
+  for i = p.Count - 1, 0, -1 do p.Child[i].destroy() end
+  fp2.recs = {}
+end
+
+function fp2.build()
+  fp2.clear()
+  fp2.settlements = fp2.scan()
+  -- the main city holds most of the shared heatstamps/prefabs/cores
+  local main, best = nil, -1
+  for _, s in ipairs(fp2.settlements) do
+    local total = 0
+    local m = fp2.readMap(s.comp, 0xB8)
+    for _, r in ipairs(SHARED) do
+      if m[r] then total = total + (readInteger(m[r]) or 0) end
+    end
+    if total > best then main, best = s, total end
+  end
+  fp2.main = main
+  if #fp2.settlements ~= 0 then
+    local g = addRec(fp2.parent, "Shared (edit = main city's part, total in name)", true)
+    for _, r in ipairs(SHARED) do
+      fp2.recs[#fp2.recs + 1] = {mr = addRec(g, r, false), shared = true, off = 0xB8, res = r, label = r}
+    end
+  end
+  local econ = {}
+  for _, e in ipairs(fp2.scan(fp2.VTE)) do econ[readQword(e.comp + 0x20)] = e.comp end
+  for _, s in ipairs(fp2.settlements) do s.econ = econ[readQword(s.comp + 0x20)] end
+  local col = 0
+  for _, s in ipairs(fp2.settlements) do
+    local title
+    if s == main then
+      title = "Main city"
+    else
+      col = col + 1
+      title = "Colony " .. col
+    end
+    title = title .. "  [" .. s.owner .. "]"
+    s.title = title
+    local g = addRec(fp2.parent, title, true)
+    for _, r in ipairs(LOCAL) do
+      fp2.recs[#fp2.recs + 1] = {mr = addRec(g, r, false), s = s, off = 0xB8, res = r, label = r}
+    end
+    if s.econ then
+      local lbl = "Guard squads (militia production)"
+      fp2.recs[#fp2.recs + 1] = {mr = addRec(g, lbl, false), s = s, obj = s.econ, off = 0xD8, res = "Militia", label = lbl}
+    end
+    local cg = addRec(g, "Capacity", true)
+    for _, c in ipairs(CAPS) do
+      fp2.recs[#fp2.recs + 1] = {mr = addRec(cg, c .. " cap", false), s = s, off = 0x108, res = c, label = c .. " cap"}
+    end
+  end
+  if #fp2.settlements == 0 then addRec(fp2.parent, "No settlements found - load a save, then re-tick", true) end
+end
+
+-- adding a key to the game's TMap (TSet + TSparseArray layout):
+--   +0x00 data, +0x08 ArrayNum, +0x0C ArrayMax, +0x10 inline alloc bits, +0x20 heap alloc bits,
+--   +0x28 NumBits, +0x2C MaxBits, +0x30 FirstFreeIndex, +0x34 NumFreeIndices,
+--   +0x38 inline hash, +0x40 heap hash, +0x48 HashSize
+-- element: key, int64 value, HashNextId, HashIndex. key hash = murmur finalizer of (ptr shr 4)
+local function pow2(n)
+  local v = 1
+  for _ = 1, n do v = v * 2 end
+  return v
+end
+
+local function keyHash(p)
+  local x = (p // 16) % 0x100000000
+  x = x ~ (x // 65536)
+  x = (x * 0x85EBCA6B) % 0x100000000
+  x = x ~ (x // 8192)
+  x = (x * 0xC2B2AE35) % 0x100000000
+  x = x ~ (x // 65536)
+  return x
+end
+
+function fp2.insert(m, res)
+  local key = fp2.keys[res]
+  if not key then error("no " .. res .. " definition seen in any stockpile or capacity list") end
+  local data, num, mx = readQword(m), readInteger(m + 8), readInteger(m + 0xC)
+  local heapBits, numBits = readQword(m + 0x20), readInteger(m + 0x28)
+  local firstFree, numFree = readInteger(m + 0x30) % 0x100000000, readInteger(m + 0x34)
+  local heapHash, hs = readQword(m + 0x40), readInteger(m + 0x48)
+  if not data or data == 0 then error("stockpile has no storage yet") end
+  if numFree ~= 0 or firstFree ~= 0xFFFFFFFF then error("stockpile has holes, not touching it") end
+  if numBits ~= num then error("bit array does not match element count") end
+  if num >= mx then error("stockpile is full (" .. num .. "/" .. mx .. "), would need a reallocation") end
+  if hs == 0 or hs % 2 ~= 0 and hs ~= 1 then error("unexpected hash size " .. tostring(hs)) end
+  local bits = (heapBits ~= 0) and heapBits or (m + 0x10)
+  local hb = (heapHash ~= 0) and heapHash or (m + 0x38)
+  -- verify our model against every existing element before writing anything
+  for i = 0, num - 1 do
+    local e = data + 0x18 * i
+    local word = readInteger(bits + 4 * (i // 32)) % 0x100000000
+    if (word // pow2(i % 32)) % 2 ~= 1 then error("element " .. i .. " not marked allocated") end
+    local k = readQword(e)
+    if k == key then error(res .. " already exists") end
+    if readInteger(e + 0x14) % 0x100000000 ~= keyHash(k) % hs then error("hash check failed on element " .. i) end
+  end
+  local reach = 0
+  for b = 0, hs - 1 do
+    local id = readInteger(hb + 4 * b) % 0x100000000
+    while id ~= 0xFFFFFFFF do
+      reach = reach + 1
+      if reach > num or id >= num then error("hash chain check failed") end
+      id = readInteger(data + 0x18 * id + 0x10) % 0x100000000
+    end
+  end
+  if reach ~= num then error("hash chains cover " .. reach .. " of " .. num .. " elements") end
+  -- write: element, allocation bit, counts, then link into its bucket
+  local bucket = keyHash(key) % hs
+  local e = data + 0x18 * num
+  writeQword(e, key)
+  writeQword(e + 8, 0)
+  writeInteger(e + 0x10, readInteger(hb + 4 * bucket))
+  writeInteger(e + 0x14, bucket)
+  local w = bits + 4 * (num // 32)
+  writeInteger(w, readInteger(w) | pow2(num % 32))
+  writeInteger(m + 0x28, num + 1)
+  writeInteger(m + 8, num + 1)
+  writeInteger(hb + 4 * bucket, num)
+  return "created (set to 0)"
+end
+
+function fp2.createMissing()
+  for _, s in ipairs(fp2.settlements) do fp2.readMap(s.comp, 0x108) end
+  local out = {}
+  for _, s in ipairs(fp2.settlements) do
+    local m = fp2.readMap(s.comp, 0xB8)
+    for _, r in ipairs(LOCAL) do
+      if not m[r] then
+        local ok, res = pcall(fp2.insert, s.comp + 0xB8, r)
+        out[#out + 1] = (s.title or "?") .. ": " .. r .. " - " .. (ok and res or ("not created: " .. tostring(res)))
+        if ok then m = fp2.readMap(s.comp, 0xB8) end
+      end
+    end
+  end
+  if #out == 0 then return "Nothing missing - every settlement already has Food, Materials and Goods entries" end
+  return table.concat(out, "\r\n")
+end
+
+function fp2.tick()
+  local stale = #fp2.settlements == 0
+  for _, s in ipairs(fp2.settlements) do
+    if not fp2.valid(s.comp) then stale = true end
+  end
+  for _, s in ipairs(fp2.settlements) do
+    if s.econ and not fp2.valid(s.econ) then stale = true end
+  end
+  if stale then
+    if getTickCount() - fp2.lastScan > 5000 then fp2.build() end
+    return
+  end
+  local maps = {}
+  for _, s in ipairs(fp2.settlements) do
+    maps[s.comp] = {[0xB8] = fp2.readMap(s.comp, 0xB8), [0x108] = fp2.readMap(s.comp, 0x108)}
+  end
+  for _, r in ipairs(fp2.recs) do
+    local a
+    if r.shared then
+      local total = 0
+      for _, s in ipairs(fp2.settlements) do
+        local sa = maps[s.comp][0xB8][r.res]
+        if sa then
+          total = total + (readInteger(sa) or 0)
+          if s == fp2.main or not a then a = sa end
+        end
+      end
+      if fp2.main and maps[fp2.main.comp][0xB8][r.res] then a = maps[fp2.main.comp][0xB8][r.res] end
+      local desc = r.label .. "  (total " .. total .. ")"
+      if a and r.mr.Description ~= desc then r.mr.Description = desc end
+    elseif r.obj then
+      a = fp2.readMap(r.obj, r.off)[r.res]
+    else
+      a = maps[r.s.comp][r.off][r.res]
+    end
+    if a then
+      if r.addr ~= a then
+        r.addr = a
+        r.mr.Address = string.format("%X", a)
+        if not r.shared then r.mr.Description = r.label end
+      end
+    elseif r.addr ~= 0 then
+      r.addr = 0
+      r.mr.Address = "0"
+      r.mr.Description = r.label .. " (none in this stockpile yet)"
+    end
+  end
+end
+
+fp2.debug = true
+local ok, err = pcall(fp2.build)
+fp2.debug = false
+if not ok then
+  messageDialog("FP2 stockpiles failed:\r\n" .. tostring(err), mtError, mbOK)
+  error(err)
+end
+fp2.timer = createTimer(nil, false)
+fp2.timer.Interval = 500
+fp2.timer.OnTimer = function()
+  local ok, err = pcall(fp2.tick)
+  if not ok and not fp2.errShown then
+    fp2.errShown = true
+    print("FP2 stockpiles: " .. tostring(err))
+  end
+end
+fp2.timer.Enabled = true
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if fp2 then
+  if fp2.timer then fp2.timer.destroy() end
+  fp2.clear()
+  fp2 = nil
+end
+{$asm}
+</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>20</ID>
+      <Description>"Create missing Food/Materials/Goods entries (tick once, then untick)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not fp2 or not fp2.createMissing then error("Tick 'Stockpiles - all settlements' first") end
+messageDialog(fp2.createMissing(), mtInformation, mbOK)
+{$asm}
+[DISABLE]
+</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+</CheatTable>
