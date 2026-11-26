@@ -469,4 +469,11 @@ messageDialog(fp2.createMissing(), mtInformation, mbOK)
 </AssemblerScript>
     </CheatEntry>
   </CheatEntries>
+  <LuaScript>-- credits popup, runs once when the table is opened
+messageDialog("Frostpunk 2 Cheat Table\r\n\r\n" ..
+  "Made by turtledog8\r\n" ..
+  "github.com/turtledog8\r\n\r\n" ..
+  "Free to use, do not distribute.\r\n" ..
+  "Back up your save before editing anything, dont blame me.", mtInformation, mbOK)
+</LuaScript>
 </CheatTable>
